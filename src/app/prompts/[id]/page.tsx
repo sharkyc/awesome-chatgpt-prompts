@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import Link from "next/link";
 import { getTranslations, getLocale } from "next-intl/server";
 import { formatDistanceToNow } from "@/lib/date";
-import { Calendar, Clock, Copy, Share2, Edit, History, GitPullRequest, Check, X, Users, ImageIcon, Video, FileText, Shield } from "lucide-react";
+import { Calendar, Clock, Edit, History, GitPullRequest, Check, X, Users, ImageIcon, Video, FileText, Shield } from "lucide-react";
 import { ShareDropdown } from "@/components/prompts/share-dropdown";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
@@ -19,15 +19,40 @@ import { DeleteVersionButton } from "@/components/prompts/delete-version-button"
 import { VersionCompareModal } from "@/components/prompts/version-compare-modal";
 import { VersionCompareButton } from "@/components/prompts/version-compare-button";
 import { FeaturePromptButton } from "@/components/prompts/feature-prompt-button";
+import { UnlistPromptButton } from "@/components/prompts/unlist-prompt-button";
 import { MediaPreview } from "@/components/prompts/media-preview";
 import { ReportPromptDialog } from "@/components/prompts/report-prompt-dialog";
+import { DelistBanner } from "@/components/prompts/delist-banner";
+import { CommentSection } from "@/components/comments";
+import { PromptConnections } from "@/components/prompts/prompt-connections";
+import { getConfig } from "@/lib/config";
 
 interface PromptPageProps {
   params: Promise<{ id: string }>;
 }
 
+/**
+ * Extracts the prompt ID from a URL parameter that may contain a slug
+ * Supports formats: "abc123", "abc123_some-slug", or "abc123_some-slug.prompt.md"
+ */
+function extractPromptId(idParam: string): string {
+  let param = idParam;
+  // Strip .prompt.md suffix if present
+  if (param.endsWith(".prompt.md")) {
+    param = param.slice(0, -".prompt.md".length);
+  }
+  // If the param contains an underscore, extract the ID (everything before first underscore)
+  const underscoreIndex = param.indexOf("_");
+  if (underscoreIndex !== -1) {
+    return param.substring(0, underscoreIndex);
+  }
+  return param;
+}
+
+
 export async function generateMetadata({ params }: PromptPageProps): Promise<Metadata> {
-  const { id } = await params;
+  const { id: idParam } = await params;
+  const id = extractPromptId(idParam);
   const prompt = await db.prompt.findUnique({
     where: { id },
     select: { title: true, description: true },
@@ -44,8 +69,10 @@ export async function generateMetadata({ params }: PromptPageProps): Promise<Met
 }
 
 export default async function PromptPage({ params }: PromptPageProps) {
-  const { id } = await params;
+  const { id: idParam } = await params;
+  const id = extractPromptId(idParam);
   const session = await auth();
+  const config = await getConfig();
   const t = await getTranslations("prompts");
   const locale = await getLocale();
 
@@ -58,9 +85,14 @@ export default async function PromptPage({ params }: PromptPageProps) {
           name: true,
           username: true,
           avatar: true,
+          verified: true,
         },
       },
-      category: true,
+      category: {
+        include: {
+          parent: true,
+        },
+      },
       tags: {
         include: {
           tag: true,
@@ -117,6 +149,11 @@ export default async function PromptPage({ params }: PromptPageProps) {
     notFound();
   }
 
+  // Check if user can view unlisted prompt (only owner and admins can see)
+  if (prompt.isUnlisted && prompt.authorId !== session?.user?.id && session?.user?.role !== "ADMIN") {
+    notFound();
+  }
+
   const isOwner = session?.user?.id === prompt.authorId;
   const isAdmin = session?.user?.role === "ADMIN";
   const canEdit = isOwner || isAdmin;
@@ -154,8 +191,21 @@ export default async function PromptPage({ params }: PromptPageProps) {
     REJECTED: X,
   };
 
+  // Get delist reason (cast to expected type after Prisma migration)
+  const delistReason = (prompt as { delistReason?: string | null }).delistReason as
+    | "TOO_SHORT" | "NOT_ENGLISH" | "LOW_QUALITY" | "NOT_LLM_INSTRUCTION" | "MANUAL" | null;
+
   return (
     <div className="container max-w-4xl py-8">
+      {/* Delist Banner - shown to owner and admins when prompt is delisted */}
+      {prompt.isUnlisted && delistReason && (isOwner || isAdmin) && (
+        <DelistBanner
+          promptId={prompt.id}
+          delistReason={delistReason}
+          isOwner={isOwner}
+        />
+      )}
+
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 mb-6">
         <div className="space-y-1 min-w-0">
@@ -370,15 +420,30 @@ export default async function PromptPage({ params }: PromptPageProps) {
                 </span>
               </div>
             )}
-            {prompt.type === "STRUCTURED" ? (
+            {prompt.structuredFormat ? (
               <InteractivePromptContent 
                 content={prompt.content} 
                 isStructured={true}
                 structuredFormat={(prompt.structuredFormat?.toLowerCase() as "json" | "yaml") || "json"}
                 title={t("promptContent")}
+                isLoggedIn={!!session?.user}
+                categoryName={prompt.category?.name}
+                parentCategoryName={prompt.category?.parent?.name}
+                promptId={prompt.id}
+                promptSlug={prompt.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}
+                promptType={prompt.type}
               />
             ) : (
-              <InteractivePromptContent content={prompt.content} title={t("promptContent")} />
+              <InteractivePromptContent 
+                content={prompt.content} 
+                title={t("promptContent")} 
+                isLoggedIn={!!session?.user}
+                categoryName={prompt.category?.name}
+                parentCategoryName={prompt.category?.parent?.name}
+                promptId={prompt.id}
+                promptSlug={prompt.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}
+                promptType={prompt.type}
+              />
             )}
           </div>
           {/* Report link */}
@@ -534,6 +599,24 @@ export default async function PromptPage({ params }: PromptPageProps) {
         )}
       </Tabs>
 
+      {/* Connected Prompts Section */}
+      <PromptConnections
+        promptId={prompt.id}
+        promptTitle={prompt.title}
+        canEdit={canEdit}
+      />
+
+      {/* Comments Section */}
+      {config.features.comments !== false && !prompt.isPrivate && (
+        <CommentSection
+          promptId={prompt.id}
+          currentUserId={session?.user?.id}
+          isAdmin={isAdmin}
+          isLoggedIn={!!session?.user}
+          locale={locale}
+        />
+      )}
+
       {/* Admin Area */}
       {isAdmin && (
         <div className="mt-8 p-4 rounded-lg border border-red-500/30 bg-red-500/5">
@@ -545,6 +628,10 @@ export default async function PromptPage({ params }: PromptPageProps) {
             <FeaturePromptButton
               promptId={prompt.id}
               isFeatured={prompt.isFeatured}
+            />
+            <UnlistPromptButton
+              promptId={prompt.id}
+              isUnlisted={prompt.isUnlisted}
             />
             <Button variant="outline" size="sm" asChild>
               <Link href={`/prompts/${id}/edit`}>
